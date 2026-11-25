@@ -44,6 +44,39 @@ class HttpJakartaServletRequestTagsTest {
     }
 
     @Test
+    void unknownMethodShouldContributeUnknownMethodTagValue() {
+        Tag unknownMethod = Tag.of("method", "UNKNOWN");
+        HttpServletRequest jakartaRequest = mockJakartaRequest("WELL");
+        Tag result = HttpJakartaServletRequestTags.method(jakartaRequest);
+        assertThat(result).isEqualTo(unknownMethod);
+
+        javax.servlet.http.HttpServletRequest javaxRequest = mockJavaxRequest("WELL");
+        result = HttpRequestTags.method(javaxRequest);
+        assertThat(result).isEqualTo(unknownMethod);
+    }
+
+    @Test
+    void standardMethodsShouldContributeMethodTag() {
+        for (String method : new String[] { "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE",
+                "PATCH" }) {
+            Tag expected = Tag.of("method", method);
+            assertThat(HttpJakartaServletRequestTags.method(mockJakartaRequest(method))).isEqualTo(expected);
+            assertThat(HttpRequestTags.method(mockJavaxRequest(method))).isEqualTo(expected);
+        }
+    }
+
+    @Test
+    void attackerControlledMethodsShouldNotInflateTagCardinality() {
+        // an attacker sending arbitrary request methods must not be able to create
+        // an unbounded number of distinct `method` tag values
+        Tag unknownMethod = Tag.of("method", "UNKNOWN");
+        for (String method : new String[] { "get", "Get", "ATTACK-0", "ATTACK-1", "", "GET /foo HTTP/1.1" }) {
+            assertThat(HttpJakartaServletRequestTags.method(mockJakartaRequest(method))).isEqualTo(unknownMethod);
+            assertThat(HttpRequestTags.method(mockJavaxRequest(method))).isEqualTo(unknownMethod);
+        }
+    }
+
+    @Test
     void requestShouldContributeMethodTag() {
         Tag httpGet = Tag.of("method", "GET");
         HttpServletRequest jakartaRequest = mockJakartaRequest("GET");
