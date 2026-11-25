@@ -1,0 +1,238 @@
+# Sealed-libraries build of io.micrometer:micrometer-core.
+# Upstream has no GitHub Actions build/test workflow (CI runs on CircleCI, see
+# .circleci/config.yml); this workflow translates its jobs: `build` on JDK 21
+# (+ shenandoah/zgc GC test tasks), `build-jdk11`, `build-jdk17`, `build-jdk24`
+# (+ generational shenandoah) and `docker-tests`, scoped to micrometer-core and
+# the modules carrying the patched paths (micrometer-registry-statsd,
+# micrometer-jetty12). The release jar is built by the JDK 21 leg, like the
+# upstream deploy job.
+name: Seal build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test selector, e.g. ":micrometer-core:test --tests FooTest"; empty runs the full suite'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2g -XX:+HeapDumpOnOutOfMemoryError" -Dorg.gradle.workers.max=2'
+  SEAL_GRADLE_FLAGS: >-
+    --no-daemon --console=plain --stacktrace --continue --no-build-cache
+    -Prelease.version=1.16.5 -Prelease.stage=final -Prelease.disableGitChecks=true
+    -PcompatibleVersion=SKIP
+  SEAL_TEST_TASKS: >-
+    :micrometer-core:test :micrometer-registry-statsd:test :micrometer-jetty12:test
+
+jobs:
+  build:
+    name: build (JDK 21, release jar)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.9'
+          cache: gradle
+      - name: Write Gradle init script (test result logging, no static-analysis gates)
+        run: &init |
+          cat > "$RUNNER_TEMP/seal-init.gradle" <<'EOF'
+          allprojects {
+              afterEvaluate {
+                  // error-prone / NullAway is a static-analysis gate run inside javac; it does not change bytecode
+                  tasks.withType(JavaCompile).configureEach { t ->
+                      def ep = t.options.extensions.findByName('errorprone')
+                      if (ep != null) { ep.enabled = false }
+                  }
+              }
+              tasks.withType(Test).configureEach { t ->
+                  t.testLogging {
+                      events 'passed', 'skipped', 'failed'
+                      exceptionFormat 'full'
+                  }
+                  t.afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println "TEST SUMMARY [${t.path}]: ${result.resultType} - ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped"
+                      }
+                  }
+              }
+          }
+          EOF
+      - name: Test
+        run: |
+          set -o pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $SEAL_GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" ${{ inputs.test-filter }} 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+          else
+            ./gradlew $SEAL_GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" $SEAL_TEST_TASKS :micrometer-core:shenandoahTest :micrometer-core:zgcTest :micrometer-core:zgcGenerationalTest 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+          fi
+      - name: Build jar
+        run: ./gradlew $SEAL_GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" :micrometer-core:jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: micrometer-core-jar
+          path: micrometer-core/build/libs/micrometer-core-1.16.5.jar
+          if-no-files-found: error
+      - name: Test summary and skipped tests
+        if: always()
+        run: &report |
+          python3 - <<'EOF'
+          # Test report: per-task Gradle summaries, retry-aware totals from the JUnit XML,
+          # and every skipped test with the reason taken from its source annotations/assumptions.
+          import glob, os, re, xml.etree.ElementTree as ET
+          log = os.path.join(os.environ["RUNNER_TEMP"], "gradle-test.log")
+          lines = open(log, errors="replace").read().splitlines() if os.path.exists(log) else []
+          src = {}
+          for p in (glob.glob("**/src/test/**/*.java", recursive=True) + glob.glob("**/src/test/**/*.kt", recursive=True)
+                    + glob.glob("micrometer-test/src/main/**/*.java", recursive=True)):
+              src.setdefault(os.path.splitext(os.path.basename(p))[0], p)
+          def method_reason(simple, meth, depth=0):
+              p = src.get(simple)
+              if not p or depth > 4:
+                  return None
+              text = open(p, errors="replace").read()
+              m = re.search(r"(?:fun|void)\s+`?" + re.escape(meth) + r"`?\s*\(", text) if meth else None
+              if m is None:
+                  sup = re.search(r"\bclass\s+" + re.escape(simple) + r"\b[^{]*?\bextends\s+(\w+)", text)
+                  return method_reason(sup.group(1), meth, depth + 1) if sup else None
+              head = text[:m.start()]
+              ends = [b.end() for b in re.finditer(r"[;{}][ \t]*\n", head)]
+              chunk = head[ends[-1] if ends else 0:]
+              body = text[m.end():m.end() + 1500]
+              found = [" ".join(a.split()) for a in re.findall(r"@(?:Disabled|Enabled)\w*(?:\([^)]*\))?", chunk)]
+              nxt = re.search(r"\n\s*(?:@\w+|(?:public |protected |private )?(?:void|fun) )", body)
+              found += ["%s" % " ".join(a.split()) for a in re.findall(r"assume\w*\([^;]{0,160}", body[:nxt.start()] if nxt else body)]
+              return "; ".join(found) if found else None
+          def reason(cls, meth):
+              simple = cls.split(".")[-1].split("$")[-1]
+              r = method_reason(simple, meth)
+              if r:
+                  return r
+              p = src.get(simple)
+              if p:
+                  text = open(p, errors="replace").read()
+                  m = re.search(r"\bclass\s+" + re.escape(simple) + r"\b", text)
+                  if m:
+                      head = text[:m.start()]
+                      chunk = head[head.rfind("*/") + 2:]
+                      found = re.findall(r"@(?:Disabled|Enabled)\w*(?:\([^)]*\))?", chunk)
+                      if found:
+                          return "class-level " + "; ".join(" ".join(a.split()) for a in found)
+              return "skipped by JUnit condition (no annotation found in source)"
+          print("==== Gradle test task summaries (raw attempts; a failed attempt followed by a passing upstream develocity.testRetry attempt is a flaky pass) ====")
+          for line in lines:
+              if line.startswith("TEST SUMMARY"):
+                  print(line)
+          outcomes = {}
+          for f in glob.glob("**/build/test-results/**/*.xml", recursive=True):
+              task = f.split("/test-results/")[1].split("/")[0]
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for tc in root.iter("testcase"):
+                  key = (task, tc.get("classname"), tc.get("name"))
+                  st = "failed" if (tc.find("failure") is not None or tc.find("error") is not None) else ("skipped" if tc.find("skipped") is not None else "passed")
+                  outcomes.setdefault(key, []).append(st)
+          final = {"passed": 0, "failed": 0, "skipped": 0}
+          flaky = []
+          for key, sts in outcomes.items():
+              if "passed" in sts:
+                  final["passed"] += 1
+                  if "failed" in sts:
+                      flaky.append((key, sts.count("failed")))
+              elif "failed" in sts:
+                  final["failed"] += 1
+              else:
+                  final["skipped"] += 1
+          skipped = {}
+          for line in lines:
+              if line.endswith(" SKIPPED") and " > " in line and not line.startswith(">"):
+                  parts = line[:-len(" SKIPPED")].split(" > ")
+                  meth = re.match(r"\s*`?([A-Za-z_$][\w$]*)\s*\(", parts[1])
+                  skipped.setdefault(line[:-len(" SKIPPED")], reason(parts[0], meth.group(1) if meth else ""))
+          # disabled parameterized containers appear only in the JUnit XML, not on the console
+          for (task, c, n), sts in outcomes.items():
+              if "passed" in sts or "failed" in sts or n.startswith("["):
+                  continue
+              simple = c.split(".")[-1].split("$")[-1]
+              label = "%s > %s" % (simple, n)
+              if not any(k.startswith(label) for k in skipped):
+                  meth = re.match(r"\s*`?([A-Za-z_$][\w$]*)\s*\(", n)
+                  skipped[label] = reason(simple, meth.group(1) if meth else "")
+          print("==== Flaky tests: failed then passed on upstream's develocity.testRetry (%d) ====" % len(flaky))
+          for (task, c, n), k in sorted(flaky):
+              print("FLAKY %s %s > %s : failed %d attempt(s), then PASSED on retry" % (task, c, n, k))
+          print("==== Skipped tests (%d) ====" % len(skipped))
+          for name, r in sorted(skipped.items()):
+              print("SKIPPED %s : %s" % (name, r))
+          print("==== TOTAL (all test tasks, final outcome per test from JUnit XML): %d tests, %d passed, %d failed, %d skipped ====" % (len(outcomes), final["passed"], final["failed"], final["skipped"]))
+          EOF
+
+  test-jdk:
+    name: test (JDK ${{ matrix.jdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jdk: '11.0.29'
+            extra: ''
+          - jdk: '17.0.17'
+            extra: ''
+          - jdk: '24.0.2'
+            extra: ':micrometer-core:generationalShenandoahTest'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.jdk }}
+          cache: gradle
+      - name: Write Gradle init script (test result logging, no static-analysis gates)
+        run: *init
+      - name: Test
+        run: |
+          set -o pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $SEAL_GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" ${{ inputs.test-filter }} 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+          else
+            ./gradlew $SEAL_GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" $SEAL_TEST_TASKS ${{ matrix.extra }} 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+          fi
+      - name: Test summary and skipped tests
+        if: always()
+        run: *report
+
+  docker-tests:
+    name: docker-tests (JDK 21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.9'
+          cache: gradle
+      - name: Write Gradle init script (test result logging, no static-analysis gates)
+        run: *init
+      - name: Docker tests
+        run: |
+          set -o pipefail
+          docker version
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            echo "test-filter set: scoped run executes the selected tests in the other jobs; docker-tagged suite not selected"
+            exit 0
+          fi
+          ./gradlew $SEAL_GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" :micrometer-core:dockerTest 2>&1 | tee "$RUNNER_TEMP/gradle-test.log"
+      - name: Test summary and skipped tests
+        if: always()
+        run: *report

@@ -305,17 +305,21 @@ class ExecutorServiceMetricsTest {
 
     @Test
     @Issue("#5650")
-    void queuedSubmissionsAreIncludedInExecutorQueuedMetric() {
+    void queuedSubmissionsAreIncludedInExecutorQueuedMetric() throws InterruptedException {
         ForkJoinPool pool = new ForkJoinPool(1, ForkJoinPool.defaultForkJoinWorkerThreadFactory, null, false, 1, 1, 1,
                 a -> true, 555, TimeUnit.MILLISECONDS);
         ExecutorServiceMetrics.monitor(registry, pool, "myForkJoinPool");
         AtomicBoolean busy = new AtomicBoolean(true);
+        CountDownLatch activeTaskStarted = new CountDownLatch(1);
 
         // will be an active task
         pool.execute(() -> {
+            activeTaskStarted.countDown();
             while (busy.get()) {
             }
         });
+        // wait until the worker has taken the active task off the submission queue
+        assertThat(activeTaskStarted.await(5, TimeUnit.SECONDS)).isTrue();
 
         // will be queued for submission
         pool.execute(() -> {
